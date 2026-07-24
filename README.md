@@ -1,6 +1,6 @@
 # cmip-intake-esgf-fetch
 
-A reproducible Python package for discovering, downloading, and inventorying native-grid CMIP5 and CMIP6 historical data using [`intake-esgf`](https://intake-esgf.readthedocs.io/).
+A reproducible Python package for discovering, downloading, and inventorying native-grid CMIP5 and CMIP6 historical data using [`intake-esgf`](https://intake-esgf.readthedocs.io/), created by *gpt-5.5* agent.
 
 The package is designed for NCAR systems and stores the intake-esgf local cache in `${SCRATCH}/cmip_intake_esgf_fetch/esgf_cache` by default.
 
