@@ -1,0 +1,59 @@
+# Default CMIP historical evapotranspiration workflow using intake-esgf.
+# Environment variables are expanded, so ${SCRATCH} is safe on NCAR systems.
+
+paths:
+  root: "${SCRATCH}/cmip_intake_esgf_fetch"
+  local_cache: "${SCRATCH}/cmip_intake_esgf_fetch/esgf_cache"
+  manifests: "${SCRATCH}/cmip_intake_esgf_fetch/manifests"
+  logs: "${SCRATCH}/cmip_intake_esgf_fetch/logs"
+  download_db: "${SCRATCH}/cmip_intake_esgf_fetch/logs/intake_esgf_download.db"
+
+intake_esgf:
+  # true is slower but more complete because it enables all configured ESGF indices.
+  all_indices: true
+  num_threads: 8
+  confirm_download: false
+  break_on_error: false
+  # NCAR/Glade mirrors are already present in intake-esgf defaults, but you may add custom roots here.
+  esg_dataroot: []
+  additional_df_cols:
+    - id
+    - instance_id
+    - dataset_id
+    - version
+    - data_node
+    - size
+    - datetime_start
+    - datetime_stop
+
+request:
+  projects: ["CMIP6"]
+  experiment: "historical"
+  frequency: "mon"
+  start_year: 1950
+  end_year: null
+  variables: ["evspsbl", "tran", "evspsblsoi", "evspsblveg", "lai", "gpp"]
+  area_variables: []
+  variable_tables: ["Lmon", "Amon", "Emon"]
+  fixed_tables: ["fx"]
+  grid_label_preference: ["gn", "gr", "gr1"]
+  member_policy: "all_members"  # first_member or all_members
+  preferred_members_cmip6: ["r1i1p1f1", "r1i1p1f2", "r1i1p1f3"]
+  preferred_members_cmip5: ["r1i1p1"]
+
+# Facet mappings are intentionally configurable because CMIP5 and CMIP6 metadata differ.
+# The defaults below work for common intake-esgf releases, but you should inspect raw manifests.
+project_configs:
+  CMIP6:
+    intake_project: "cmip6"
+    base_facets:
+      mip_era: "CMIP6"
+      activity_drs: "CMIP"
+      experiment_id: "historical"
+      frequency: "mon"
+    variable_facet: "variable_id"
+    table_facet: "table_id"
+    source_facet: "source_id"
+    member_facet: "member_id"
+    grid_facet: "grid_label"
+    fixed_table_values: ["fx"]
