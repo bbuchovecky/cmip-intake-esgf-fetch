@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cmip-intake-esgf-fetch"
-version = "0.2.0"
-description = "Discover, download, and inventory native-grid CMIP5/CMIP6 data using intake-esgf."
+version = "0.3.0"
+description = "Find CMIP data with intake-esgf, reuse copies already on glade, and catalog it for intake-esm."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{name = "Your Name"}]
 license = {text = "MIT"}
 dependencies = [
-  "intake-esgf>=2026.6.4",
+  "intake-esgf>=2026.6.4,<2027",  # local.py patches intake_esgf.base.get_local_file
   "pandas>=2.2",
   "pyyaml>=6.0",
   "xarray>=2025.1",
@@ -24,13 +24,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "mypy"]
+dev = ["pytest", "intake-esm", "ruff", "mypy"]
 
 [project.scripts]
 cmip-intake-fetch = "cmip_intake_esgf_fetch.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

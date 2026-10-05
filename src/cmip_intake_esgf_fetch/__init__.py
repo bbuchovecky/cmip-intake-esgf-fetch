@@ -1,3 +1,3 @@
-"""Tools for discovering and downloading native-grid CMIP data using intake-esgf."""
+"""Find CMIP data with intake-esgf, reuse copies already on glade, and catalog it for intake-esm."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -87,28 +87,49 @@ def _query_for(
     return query
 
 
-def search_one(cfg: WorkflowConfig, project: str, variable: str, table_values: list[str]) -> pd.DataFrame:
+def _tables_for(cfg: WorkflowConfig, project: str, variable: str) -> tuple[list[str], bool]:
+    """Return (table values, include time bounds) for a requested variable."""
+    req = cfg.request
+    if variable in req.get("area_variables", []):
+        tables = cfg.project_configs[project].get("fixed_table_values", req.get("fixed_tables", []))
+        return tables, False
+    return req.get("variable_tables", []), True
+
+
+def requested_groups(cfg: WorkflowConfig) -> list[tuple[str, str]]:
+    """Return every (project, variable) pair in the request, in order."""
+    req = cfg.request
+    variables = req.get("variables", []) + req.get("area_variables", [])
+    return [(project, variable) for project in req["projects"] for variable in variables]
+
+
+def search_group(cfg: WorkflowConfig, project: str, variable: str) -> tuple[ESGFCatalog | None, pd.DataFrame]:
+    """Search ESGF for one (project, variable) pair.
+
+    Returns the live catalog, so callers can subset ``cat.df`` and download without searching
+    again, and a copy of its dataframe annotated with the ``requested_*`` columns. The catalog
+    is ``None`` when the search fails or finds nothing.
+    """
     pcfg = cfg.project_configs[project]
+    tables, include_time_bounds = _tables_for(cfg, project, variable)
     cat = ESGFCatalog()
     _set_project(cat, pcfg.get("intake_project", project.lower()))
-    query = _query_for(cfg, project, variable, table_values)
+    query = _query_for(cfg, project, variable, tables, include_time_bounds=include_time_bounds)
     LOGGER.info("Searching %s %s with %s", project, variable, query)
     try:
         cat.search(**query, quiet=True)
-    except TypeError:
-        # Older/newer APIs may not accept quiet.
-        cat.search(**query)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Search failed for %s %s: %s", project, variable, exc)
-        return pd.DataFrame()
+        return None, pd.DataFrame()
 
-    df = getattr(cat, "df", pd.DataFrame()).copy()
-    if df.empty:
-        return df
+    df = getattr(cat, "df", None)
+    if df is None or df.empty:
+        return None, pd.DataFrame()
+    df = df.copy()
     df["requested_project"] = project
     df["requested_variable"] = variable
-    df["requested_tables"] = ",".join(table_values)
-    return df
+    df["requested_tables"] = ",".join(tables)
+    return cat, df
 
 
 def _select_preferred_rows(df: pd.DataFrame, cfg: WorkflowConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -165,8 +186,9 @@ def _select_preferred_rows(df: pd.DataFrame, cfg: WorkflowConfig) -> tuple[pd.Da
         if not rejected.empty:
             rejected_parts.append(rejected)
 
-    selected = pd.concat(selected_parts, ignore_index=True) if selected_parts else pd.DataFrame()
-    rejected = pd.concat(rejected_parts, ignore_index=True) if rejected_parts else pd.DataFrame()
+    # Keep the input index so callers can subset the catalog the rows came from.
+    selected = pd.concat(selected_parts) if selected_parts else pd.DataFrame()
+    rejected = pd.concat(rejected_parts) if rejected_parts else pd.DataFrame()
 
     for frame in [selected, rejected]:
         for col in ["_grid_rank", "_table_rank", "_member_rank"]:
@@ -175,44 +197,10 @@ def _select_preferred_rows(df: pd.DataFrame, cfg: WorkflowConfig) -> tuple[pd.Da
     return selected, rejected
 
 
-def build_manifest(cfg: WorkflowConfig) -> dict[str, Path]:
-    configure_intake_esgf(cfg)
-    req = cfg.request
-    manifests_dir = cfg.paths["manifests"]
-
-    frames: list[pd.DataFrame] = []
-    for project in req["projects"]:
-        variables = req.get("variables", []) + req.get("area_variables", [])
-        for variable in variables:
-            if variable in req.get("area_variables", []):
-                tables = cfg.project_configs[project].get("fixed_table_values", req.get("fixed_tables", []))
-                include_time_bounds = False
-            else:
-                tables = req.get("variable_tables", [])
-                include_time_bounds = True
-            # Rebuild query here to allow fixed fields to skip time filters.
-            pcfg = cfg.project_configs[project]
-            cat = ESGFCatalog()
-            _set_project(cat, pcfg.get("intake_project", project.lower()))
-            query = _query_for(cfg, project, variable, tables, include_time_bounds=include_time_bounds)
-            LOGGER.info("Searching %s %s with %s", project, variable, query)
-            try:
-                cat.search(**query, quiet=True)
-            except TypeError:
-                cat.search(**query)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("Search failed for %s %s: %s", project, variable, exc)
-                continue
-            df = getattr(cat, "df", pd.DataFrame()).copy()
-            if not df.empty:
-                df["requested_project"] = project
-                df["requested_variable"] = variable
-                df["requested_tables"] = ",".join(tables)
-                frames.append(df)
-
-    raw = _drop_duplicates_safe(pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame()
-    selected, rejected = _select_preferred_rows(raw, cfg)
-
+def write_manifests(
+    manifests_dir: Path, raw: pd.DataFrame, selected: pd.DataFrame, rejected: pd.DataFrame
+) -> dict[str, Path]:
+    """Write the raw, selected and rejected search manifests."""
     outputs = {
         "raw": manifests_dir / "cmip_intake_manifest_raw.csv",
         "selected": manifests_dir / "cmip_intake_manifest_selected.csv",
@@ -224,36 +212,14 @@ def build_manifest(cfg: WorkflowConfig) -> dict[str, Path]:
     return outputs
 
 
-def subset_catalog_to_manifest(cat: ESGFCatalog, manifest: pd.DataFrame, project: str, variable: str) -> ESGFCatalog:
-    """Subset an intake-esgf catalog to rows selected in the manifest."""
-    out = copy.deepcopy(cat)
-    df = getattr(cat, "df", pd.DataFrame()).copy()
-    target = manifest[
-        (manifest["requested_project"] == project) & (manifest["requested_variable"] == variable)
-    ].copy()
-    if df.empty or target.empty:
-        out.df = pd.DataFrame()
-        return out
-
-    common_cols = [c for c in target.columns if c in df.columns and c not in {"size"}]
-    id_cols = [c for c in ["id", "instance_id", "dataset_id"] if c in common_cols]
-    if id_cols:
-        mask = False
-        for col in id_cols:
-            mask = mask | df[col].astype(str).isin(set(target[col].dropna().astype(str)))
-        out.df = df[mask].copy()
-        return out
-
-    key_cols = [
-        c
-        for c in ["mip_era", "activity_drs", "institution_id", "source_id", "experiment_id", "member_id", "table_id", "variable_id", "grid_label", "version"]
-        if c in common_cols
-    ]
-    if not key_cols:
-        out.df = df.iloc[0:0].copy()
-        return out
-
-    target_keys = set(target[key_cols].astype(str).agg("|".join, axis=1))
-    df_keys = df[key_cols].astype(str).agg("|".join, axis=1)
-    out.df = df[df_keys.isin(target_keys)].copy()
-    return out
+def build_manifest(cfg: WorkflowConfig) -> dict[str, Path]:
+    """Search every requested (project, variable) and write the manifests, without downloading."""
+    configure_intake_esgf(cfg)
+    frames: list[pd.DataFrame] = []
+    for project, variable in requested_groups(cfg):
+        _, df = search_group(cfg, project, variable)
+        if not df.empty:
+            frames.append(df)
+    raw = _drop_duplicates_safe(pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame()
+    selected, rejected = _select_preferred_rows(raw, cfg)
+    return write_manifests(cfg.paths["manifests"], raw, selected, rejected)

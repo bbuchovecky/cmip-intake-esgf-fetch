@@ -8,7 +8,7 @@ paths:
   logs: "${SCRATCH}/cmip_intake_esgf_fetch/logs"
   download_db: "${SCRATCH}/cmip_intake_esgf_fetch/logs/intake_esgf_download.db"
   # intake-esm catalog written by `fetch`; the .json descriptor is written next to it.
-  catalog: "${SCRATCH}/cmip_intake_esgf_fetch/catalogs/cmip_fixed.csv"
+  catalog: "${SCRATCH}/cmip_intake_esgf_fetch/catalogs/cmip_rad.csv"
 
 intake_esgf:
   # true is slower but more complete because it enables all configured ESGF indices.
@@ -35,13 +35,13 @@ intake_esgf:
 
 request:
   projects: ["CMIP6"]
-  # experiment: "piControl"
-  # frequency: "mon"
+  experiment: "historical"
+  frequency: "mon"
   start_year: 1950
   end_year: null
-  variables: []
-  area_variables: ["areacella", "sftlf"]
-  variable_tables: []
+  variables: ["hfss"]
+  area_variables: []
+  variable_tables: ["Amon"]
   fixed_tables: ["fx"]
   grid_label_preference: ["gn", "gr", "gr1"]
   member_policy: "all_members"  # first_member or all_members
@@ -56,8 +56,8 @@ project_configs:
     base_facets:
       mip_era: "CMIP6"
       activity_drs: "CMIP"
-      # experiment_id: "historical"
-      # frequency: "mon"
+      experiment_id: "historical"
+      frequency: "mon"
     variable_facet: "variable_id"
     table_facet: "table_id"
     source_facet: "source_id"

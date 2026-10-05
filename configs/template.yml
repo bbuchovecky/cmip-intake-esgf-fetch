@@ -7,6 +7,8 @@ paths:
   manifests: "${SCRATCH}/cmip_intake_esgf_fetch/manifests"
   logs: "${SCRATCH}/cmip_intake_esgf_fetch/logs"
   download_db: "${SCRATCH}/cmip_intake_esgf_fetch/logs/intake_esgf_download.db"
+  # intake-esm catalog written by `fetch`; the .json descriptor is written next to it.
+  catalog: "${SCRATCH}/cmip_intake_esgf_fetch/catalogs/cmip.csv"
 
 intake_esgf:
   # true is slower but more complete because it enables all configured ESGF indices.
@@ -14,8 +16,13 @@ intake_esgf:
   num_threads: 8
   confirm_download: false
   break_on_error: false
-  # NCAR/Glade mirrors are already present in intake-esgf defaults, but you may add custom roots here.
-  esg_dataroot: []
+  # Read-only roots checked (in order) before downloading, as `name: path`. The name is written
+  # to the catalog's `location` column. Files are found in both the ESGF layout
+  # (.../vYYYYMMDD/<file>.nc) and the synda layout (.../vYYYYMMDD/<variable_id>/<file>.nc).
+  # Only the exact dataset version selected from ESGF counts; older mirror versions are ignored.
+  esg_dataroot:
+    mirror: "/glade/campaign/collections/cmip.mirror"
+    cdg: "/glade/campaign/collections/cdg/data"
   additional_df_cols:
     - id
     - instance_id

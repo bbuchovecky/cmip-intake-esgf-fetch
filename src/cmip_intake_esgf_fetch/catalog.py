@@ -1,7 +1,20 @@
+"""Write intake-esm catalogs of CMIP files.
+
+Two producers share this module:
+
+- ``fetch`` builds rows from intake-esgf search results plus the local path of each file
+  (``esm_rows``), appends them with ``append_csv`` and describes them with
+  ``write_esm_descriptor``. No files are opened.
+- ``scan`` walks an arbitrary directory and optionally opens every file to record grid and
+  time metadata (``scan_directory``).
+"""
+
 from __future__ import annotations
 
 import csv
+import json
 import re
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,8 +23,135 @@ from typing import Any
 import numpy as np
 import xarray as xr
 
-from .config import load_config
+# ---------------------------------------------------------------------------------------------
+# intake-esm catalog written by `fetch`
+# ---------------------------------------------------------------------------------------------
 
+ESM_COLUMNS = [
+    "activity_id",
+    "institution_id",
+    "source_id",
+    "experiment_id",
+    "member_id",
+    "table_id",
+    "variable_id",
+    "grid_label",
+    "version",
+    "time_range",
+    "location",
+    "path",
+]
+
+# Catalog column -> intake-esgf dataframe columns that may hold it (CMIP6 names first).
+FACET_ALIASES: dict[str, tuple[str, ...]] = {
+    "activity_id": ("activity_drs", "activity_id"),
+    "institution_id": ("institution_id", "institute"),
+    "source_id": ("source_id", "model"),
+    "experiment_id": ("experiment_id", "experiment"),
+    "member_id": ("member_id", "ensemble"),
+    "table_id": ("table_id", "cmor_table"),
+    "variable_id": ("variable_id", "variable"),
+    "grid_label": ("grid_label",),
+    "version": ("version",),
+}
+
+ESM_GROUPBY = ["activity_id", "institution_id", "source_id", "experiment_id", "table_id", "grid_label"]
+
+
+def first_facet(row: Mapping[str, Any], names: Iterable[str]) -> str:
+    for name in names:
+        value = row.get(name)
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if value is not None and str(value) not in ("", "nan"):
+            return str(value)
+    return ""
+
+
+def location_of(path: Path, roots: Mapping[str, Path]) -> str:
+    """Return the name of the first root containing ``path``, or ``"other"``."""
+    for name, root in roots.items():
+        if Path(path).is_relative_to(Path(root)):
+            return name
+    return "other"
+
+
+def esm_rows(
+    dataset_row: Mapping[str, Any],
+    paths: Iterable[str | Path],
+    roots: Mapping[str, Path],
+) -> list[dict[str, str]]:
+    """Build catalog rows for one dataset from its intake-esgf dataframe row and file paths.
+
+    ``roots`` maps a location label (e.g. ``mirror``, ``cdg``, ``cache``) to its directory and
+    fills the ``location`` column.
+    """
+    facets = {col: first_facet(dataset_row, names) for col, names in FACET_ALIASES.items()}
+    if facets["version"]:
+        facets["version"] = "v" + facets["version"].removeprefix("v")
+    rows = []
+    for path in sorted(Path(p) for p in paths):
+        row = dict(facets)
+        row["time_range"] = parse_filename(path).get("time_range", "")
+        row["location"] = location_of(path, roots)
+        row["path"] = str(path)
+        rows.append(row)
+    return rows
+
+
+def append_csv(rows: list[dict[str, str]], output: Path, columns: list[str] = ESM_COLUMNS) -> None:
+    """Append rows to ``output``, writing the header if the file is new or empty."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    new = not output.exists() or output.stat().st_size == 0
+    with output.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        if new:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_esm_descriptor(csv_path: Path, json_path: Path | None = None, description: str = "") -> Path:
+    """Write an esmcat 0.1.0 JSON descriptor so ``intake.open_esm_datastore(json_path)`` works.
+
+    The layout follows NCAR's ``glade-cmip6.json``: one dataset per (activity, institution,
+    source, experiment, table, grid), files joined along ``time`` by ``time_range`` and members
+    stacked along a new ``member_id`` dimension. ``catalog_file`` is stored relative to the JSON
+    file, so keep the two files together.
+    """
+    csv_path = Path(csv_path)
+    json_path = Path(json_path) if json_path is not None else csv_path.with_suffix(".json")
+    descriptor = {
+        "esmcat_version": "0.1.0",
+        "id": csv_path.stem,
+        "description": description or f"CMIP files cataloged by cmip-intake-esgf-fetch ({csv_path.name})",
+        "catalog_file": csv_path.name if json_path.parent == csv_path.parent else str(csv_path),
+        "attributes": [{"column_name": c, "vocabulary": ""} for c in FACET_ALIASES],
+        "assets": {"column_name": "path", "format": "netcdf"},
+        "aggregation_control": {
+            "variable_column_name": "variable_id",
+            "groupby_attrs": ESM_GROUPBY,
+            "aggregations": [
+                {"type": "union", "attribute_name": "variable_id"},
+                {
+                    "type": "join_existing",
+                    "attribute_name": "time_range",
+                    "options": {"dim": "time", "coords": "minimal", "compat": "override"},
+                },
+                {
+                    "type": "join_new",
+                    "attribute_name": "member_id",
+                    "options": {"coords": "minimal", "compat": "override"},
+                },
+            ],
+        },
+    }
+    json_path.write_text(json.dumps(descriptor, indent=2) + "\n")
+    return json_path
+
+
+# ---------------------------------------------------------------------------------------------
+# Directory scan (formerly scripts/catalog_esgf_cache.py)
+# ---------------------------------------------------------------------------------------------
 
 OUTPUT_COLUMNS = [
     "status",
@@ -79,11 +219,6 @@ CMIP5_FILENAME_RE = re.compile(
 )
 
 
-def utc_now_string() -> str:
-    """Return a filesystem-safe UTC timestamp string."""
-    return datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
 def utc_mtime(path: Path) -> str:
     """Return a file modification time as an ISO-8601 UTC string."""
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
@@ -132,6 +267,23 @@ def parse_filename(path: Path) -> dict[str, str]:
     if len(parts) > 1:
         out["table_id"] = parts[1]
     return out
+
+
+def parse_drs_path(path: Path) -> dict[str, str]:
+    """Infer activity, institution and version from a CMIP6 DRS directory path.
+
+    Handles both ``.../<grid>/vYYYYMMDD/<file>`` and ``.../<grid>/vYYYYMMDD/<variable>/<file>``.
+    """
+    parts = Path(path).parts
+    for i, part in enumerate(parts):
+        if part != "CMIP6" or len(parts) < i + 11:
+            continue
+        # activity/institution/source/experiment/member/table/variable/grid, then version
+        drs = parts[i + 1 : i + 9]
+        version = parts[i + 9]
+        if re.fullmatch(r"v\d{8}", version):
+            return {"activity_id": drs[0], "institution_id": drs[1], "version": version}
+    return {}
 
 
 def find_coord_by_standard_name(ds: Any, standard_names: set[str]) -> str:
@@ -331,6 +483,8 @@ def catalog_one(args: tuple[str, str, bool]) -> dict[str, str]:
     cache_dir = Path(cache_dir_str)
 
     filename_info = parse_filename(path)
+    drs_info = parse_drs_path(path)
+    filename_info.update(drs_info)
     row = {col: "" for col in OUTPUT_COLUMNS}
     row.update(filename_info)
 
@@ -353,6 +507,8 @@ def catalog_one(args: tuple[str, str, bool]) -> dict[str, str]:
                     row[key] = value
             for key, value in filename_info.items():
                 row[key] = row.get(key) or value
+            # The DRS directory version beats the `version` attribute (often data_specs_version).
+            row.update(drs_info)
         except Exception as exc:
             row["status"] = "error"
             row["error"] = f"{type(exc).__name__}: {exc}"
@@ -360,9 +516,17 @@ def catalog_one(args: tuple[str, str, bool]) -> dict[str, str]:
     return row
 
 
-def find_netcdf_files(cache_dir: Path) -> list[Path]:
-    """Return files ending exactly in .nc, excluding temporary files like .ncabc123."""
-    return sorted(path for path in cache_dir.rglob("*.nc") if path.is_file() and path.name.endswith(".nc"))
+def find_netcdf_files(cache_dir: Path, pattern: str = "*.nc", regex: bool = False) -> list[Path]:
+    """Return files matching ``pattern`` that end exactly in .nc (skipping temp files like .ncabc123).
+
+    ``pattern`` is a glob, or a regular expression matched against the filename if ``regex``.
+    """
+    if regex:
+        repatt = re.compile(pattern)
+        candidates = (p for p in cache_dir.rglob("*.nc") if repatt.match(p.name))
+    else:
+        candidates = cache_dir.rglob(pattern)
+    return sorted(p for p in candidates if p.is_file() and p.name.endswith(".nc"))
 
 
 def write_csv(rows: list[dict[str, str]], output: Path) -> None:
@@ -374,26 +538,33 @@ def write_csv(rows: list[dict[str, str]], output: Path) -> None:
         writer.writerows(rows)
 
 
-def catalog_cache(
+def scan_directory(
     cache_dir: Path,
     output: Path,
     *,
+    pattern: str = "*.nc",
+    regex: bool = False,
     open_files: bool = True,
     workers: int = 1,
+    esm_json: bool = False,
 ) -> Path:
-    """Recursively catalog an intake-esgf cache directory.
+    """Recursively catalog the NetCDF files under a directory.
 
     Parameters
     ----------
     cache_dir
-        Root intake-esgf cache directory to recursively scan.
+        Directory to recursively scan (e.g. an intake-esgf cache).
     output
         Output CSV path.
+    pattern, regex
+        Glob (or, with ``regex``, a regular expression on the filename) selecting files.
     open_files
         If true, open each NetCDF file with xarray and extract metadata.
-        If false, only path, size, modification time, and filename metadata are cataloged.
+        If false, only path, size, modification time, and filename/DRS metadata are cataloged.
     workers
         Number of worker processes. Use one worker for safest behavior on shared filesystems.
+    esm_json
+        Also write an intake-esm JSON descriptor next to ``output``.
 
     Returns
     -------
@@ -408,7 +579,7 @@ def catalog_cache(
     if not cache_dir.is_dir():
         raise NotADirectoryError(f"Cache path is not a directory: {cache_dir}")
 
-    files = find_netcdf_files(cache_dir)
+    files = find_netcdf_files(cache_dir, pattern, regex)
     tasks = [(str(path), str(cache_dir), open_files) for path in files]
 
     if workers <= 1:
@@ -422,35 +593,15 @@ def catalog_cache(
         rows.sort(key=lambda row: row["path"])
 
     write_csv(rows, output)
+    if esm_json:
+        print(f"Wrote JSON: {write_esm_descriptor(output)}")
 
     n_ok = sum(row["status"] == "ok" for row in rows)
     n_error = sum(row["status"] != "ok" for row in rows)
     print(f"Scanned cache: {cache_dir}")
-    print(f"NetCDF files ending exactly in .nc: {len(files)}")
+    print(f"NetCDF files matching {pattern!r}: {len(files)}")
     print(f"Readable/cataloged successfully: {n_ok}")
     print(f"Errors: {n_error}")
     print(f"Wrote CSV: {output}")
 
     return output
-
-
-def catalog_from_config(
-    config_path: str | Path,
-    *,
-    no_open: bool = False,
-    workers: int = 1,
-) -> Path:
-    """Catalog the configured local_cache and write a timestamped CSV to manifests."""
-    config = load_config(config_path)
-    paths = config.paths
-
-    cache_dir = paths["local_cache"]
-    manifests_dir = paths["manifests"]
-    output = manifests_dir / f"esgf_cache_catalog_{utc_now_string()}.csv"
-
-    return catalog_cache(
-        cache_dir=cache_dir,
-        output=output,
-        open_files=not no_open,
-        workers=workers,
-    )
